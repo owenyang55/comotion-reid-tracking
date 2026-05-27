@@ -2,7 +2,7 @@
 from __future__ import annotations
 from scipy.optimize import linear_sum_assignment
 
-from typing import Dict
+from typing import Any, Dict
 
 import tensordict
 import torch
@@ -20,6 +20,36 @@ default_dims = {
     "id": (1,),
     "appearance": (384,),
 }
+
+
+def _pairwise_bbox_iou(boxes0: torch.Tensor, boxes1: torch.Tensor) -> torch.Tensor:
+    """Return pairwise IoU for bbox tensors shaped (..., 2, 2)."""
+    if boxes0.numel() == 0 or boxes1.numel() == 0:
+        return torch.zeros(
+            (*boxes0.shape[:-2], *boxes1.shape[:-2]),
+            device=boxes0.device if boxes0.numel() else boxes1.device,
+        )
+
+    boxes0 = boxes0.float()
+    boxes1 = boxes1.float()
+
+    b0_min = boxes0[..., 0, :]
+    b0_max = boxes0[..., 1, :]
+    b1_min = boxes1[..., 0, :]
+    b1_max = boxes1[..., 1, :]
+
+    inter_min = torch.maximum(b0_min.unsqueeze(-2), b1_min.unsqueeze(-3))
+    inter_max = torch.minimum(b0_max.unsqueeze(-2), b1_max.unsqueeze(-3))
+    inter_wh = (inter_max - inter_min).clamp_min(0)
+    inter_area = inter_wh[..., 0] * inter_wh[..., 1]
+
+    area0 = ((b0_max[..., 0] - b0_min[..., 0]).clamp_min(0) *
+             (b0_max[..., 1] - b0_min[..., 1]).clamp_min(0))
+    area1 = ((b1_max[..., 0] - b1_min[..., 0]).clamp_min(0) *
+             (b1_max[..., 1] - b1_min[..., 1]).clamp_min(0))
+
+    union = area0.unsqueeze(-1) + area1.unsqueeze(-2) - inter_area
+    return inter_area / union.clamp_min(1e-6)
 
 
 @tensordict.tensorclass
@@ -184,6 +214,115 @@ class TrackHealthMonitor:
         return scores.max().item()
 
 
+class TrackHealthMonitor:
+    """Health tracker with conservative revive penalties."""
+
+    def __init__(
+        self,
+        init_timestep,
+        match_discard_thr=0.15,
+        inbounds_discard_thr=0.15,
+        ema_coef=0.8,
+        init_hidden=None,
+        memory_size=10,
+        quick_reloss_window=12,
+        revive_penalty_decay=0.01,
+    ):
+        self.match_discard_thr = match_discard_thr
+        self.inbounds_discard_thr = inbounds_discard_thr
+        self.ema_coef = ema_coef
+        self.init_timestep = init_timestep
+
+        self.age = 0
+        self.data_keys = ["root pos", "root vel", "match", "overlap", "inbounds"]
+        self.attributes = {
+            k: MonitorAttribute(ema_coef=[ema_coef]) for k in self.data_keys
+        }
+        self.is_redundant = False
+
+        self.memory_size = memory_size
+        self.feature_gallery = []
+        self.revive_age = 0
+        self.appearance_emb = None
+        self.revive_count = 0
+        self.quick_reloss_window = quick_reloss_window
+        self.revive_penalty_decay = revive_penalty_decay
+        self.quick_reloss_count = 0
+        self.revive_penalty = 0.0
+
+        if init_hidden is not None:
+            norm_feat = torch.nn.functional.normalize(init_hidden.float().cpu(), dim=-1)
+            self.feature_gallery.append(norm_feat)
+            self.appearance_emb = norm_feat
+
+    def update(self, root_pos, match_scores, track_overlap, inbounds_pct, current_hidden=None):
+        self.age += 1
+        self.revive_age += 1
+
+        if self.age > 1:
+            diff = root_pos - self.attributes["root pos"].log[-1]
+            diff[..., 2] /= 3
+            root_vel = diff.norm()
+        else:
+            root_vel = torch.zeros([])
+
+        for key, value in zip(
+            self.data_keys,
+            [root_pos, root_vel, match_scores, track_overlap, inbounds_pct],
+        ):
+            self.attributes[key].update(value)
+
+        if current_hidden is not None and match_scores > 0.4:
+            new_emb = torch.nn.functional.normalize(current_hidden.float().cpu(), dim=-1)
+            if self.appearance_emb is None:
+                self.appearance_emb = new_emb
+            else:
+                self.appearance_emb = self.ema_coef * self.appearance_emb + (1 - self.ema_coef) * new_emb
+                self.appearance_emb = torch.nn.functional.normalize(self.appearance_emb, dim=-1)
+
+            if match_scores > 0.6:
+                if len(self.feature_gallery) == 0:
+                    self.feature_gallery.append(new_emb)
+                else:
+                    last_sim = torch.sum(self.feature_gallery[-1] * new_emb)
+                    if last_sim < 0.95:
+                        self.feature_gallery.append(new_emb)
+
+            if len(self.feature_gallery) > self.memory_size:
+                self.feature_gallery.pop(0)
+
+        if self.revive_penalty > 0 and self.revive_age >= self.quick_reloss_window:
+            self.revive_penalty = max(0.0, self.revive_penalty - self.revive_penalty_decay)
+
+    def get(self, key, ema_coef=None, use_ema=False):
+        if use_ema:
+            ema_coef = self.ema_coef
+        if ema_coef is None:
+            return self.attributes[key].log[-1]
+        return self.attributes[key].ema_log[ema_coef][-1]
+
+    def get_current_health(self):
+        if self.revive_age < 5:
+            return 1
+        if self.is_redundant:
+            return 0
+        if self.age <= 3 and self.get("match") < self.match_discard_thr:
+            return 0
+        if self.get("match", self.ema_coef) < self.match_discard_thr:
+            return 0
+        if self.get("inbounds", self.ema_coef) < self.inbounds_discard_thr:
+            return 0
+        return 1
+
+    def compute_max_similarity(self, query_hidden):
+        if not self.feature_gallery:
+            return 0.0
+        query_norm = torch.nn.functional.normalize(query_hidden.float(), dim=-1)
+        gallery_stack = torch.stack(self.feature_gallery)
+        scores = torch.matmul(gallery_stack, query_norm).squeeze()
+        return scores.max().item()
+
+
 class TrackHandler:
     def __init__(
         self,
@@ -218,9 +357,47 @@ class TrackHandler:
         self.overlap_thr = overlap_thr
         self.overlap_time_thr = overlap_time_thr
         self.vel_outlier_thr = vel_outlier_thr
+        self.revive_app_base_thr = 0.72
+        self.revive_app_age_step = 0.012
+        self.revive_app_age_cap = 8
+        self.revive_dist_base = 1.35
+        self.revive_dist_age_step = 0.10
+        self.revive_dist_age_cap = 10
+        self.revive_active_overlap_thr = 0.35
+        self.revive_accept_thr = 0.66
+        self.revive_score_app_weight = 0.7
+        self.revive_score_pos_weight = 0.3
+        self.revive_quick_loss_window = 12
+        self.revive_penalty_step = 0.08
+        self.revive_penalty_max = 0.24
+        self.revive_penalty_decay = 0.01
 
         self.lost_tracks = []   #增加丢失轨迹列表
         self.max_lost_patience = 60 #允许消失最大时间
+
+        self.revive_decision_log = []
+        self.revive_log_fields = [
+            "frame",
+            "lost_id",
+            "lost_age",
+            "det_idx",
+            "app_score",
+            "app_thr",
+            "app_margin",
+            "pos_score",
+            "dist",
+            "dist_thr",
+            "dist_margin",
+            "active_overlap",
+            "active_overlap_thr",
+            "active_overlap_margin",
+            "revive_penalty",
+            "score",
+            "gate_pass",
+            "selected_by_assignment",
+            "accepted/rejected",
+            "reason",
+        ]
 
     def clear_tracks(self):
         """Clear existing tracks, preserve last_track_id."""
@@ -306,6 +483,8 @@ class TrackHandler:
                 for track in init_state[0]:
                     self.health_monitors[track.id.item()] = TrackHealthMonitor(
                         self.current_step,
+                        quick_reloss_window=self.revive_quick_loss_window,
+                        revive_penalty_decay=self.revive_penalty_decay,
                         init_hidden=track.appearance,   #改用检测头数据
                     )
 
@@ -482,6 +661,178 @@ class TrackHandler:
             
 
 
+    def revive_lost_tracks(self, detections):
+        if not self.lost_tracks:
+            return []
+        if "appearance" not in detections.keys() or "pred_2d" not in detections.keys() or "trans" not in detections.keys():
+            return []
+
+        det_feats = detections["appearance"][0].cpu()
+        det_pos = detections["trans"][0].cpu()
+        det_2d = detections["pred_2d"][0].cpu()
+        num_dets = det_feats.shape[0]
+        if num_dets == 0:
+            return []
+
+        active_iou_matrix = None
+        if self.current_tracks is not None and self.current_tracks.shape[1] > 0:
+            active_boxes = helper.points_to_bbox2d(self.current_tracks.pred_2d[0].cpu())
+            if active_boxes.shape[0] > 0:
+                det_boxes = helper.points_to_bbox2d(det_2d)
+                active_iou_matrix = _pairwise_bbox_iou(det_boxes, active_boxes)
+
+        num_lost = len(self.lost_tracks)
+        cost_matrix = torch.full((num_lost, num_dets), 100.0)
+        pair_log_index = {}
+
+        for i in range(num_lost):
+            lost_track_data, monitor = self.lost_tracks[i]
+            last_pos = lost_track_data.trans[0].cpu()
+            pos_history = monitor.attributes["root pos"].log
+            velocity_vector = torch.zeros_like(last_pos)
+            if len(pos_history) > 2:
+                velocity_vector = pos_history[-1].cpu() - pos_history[-2].cpu()
+            predicted_pos = last_pos + velocity_vector * max(1, monitor.lost_age)
+
+            age_bonus = min(max(monitor.lost_age - 1, 0), self.revive_app_age_cap)
+            dist_age_bonus = min(monitor.lost_age, self.revive_dist_age_cap)
+            app_thr = min(
+                0.95,
+                self.revive_app_base_thr
+                + self.revive_app_age_step * age_bonus
+                + min(monitor.revive_penalty, self.revive_penalty_max),
+            )
+            dist_thr = self.revive_dist_base + self.revive_dist_age_step * dist_age_bonus
+            active_overlap_thr = self.revive_active_overlap_thr
+
+            for j in range(num_dets):
+                app_score = float(monitor.compute_max_similarity(det_feats[j]))
+                dist = float(torch.norm(predicted_pos - det_pos[j]).item())
+                pos_score = max(0.0, 1.0 - dist / max(dist_thr, 1e-6))
+                active_overlap = 0.0
+                if active_iou_matrix is not None and active_iou_matrix.numel() > 0:
+                    active_overlap = float(active_iou_matrix[j].max().item())
+
+                gate_reasons = []
+                if app_score < app_thr:
+                    gate_reasons.append("appearance")
+                if dist > dist_thr:
+                    gate_reasons.append("jump")
+                if active_overlap > active_overlap_thr:
+                    gate_reasons.append("active_overlap")
+                gate_pass = len(gate_reasons) == 0
+
+                score = (
+                    self.revive_score_app_weight * app_score
+                    + self.revive_score_pos_weight * pos_score
+                    - 0.05 * min(monitor.revive_penalty, self.revive_penalty_max)
+                    - 0.05 * active_overlap
+                )
+                score = max(0.0, min(1.0, score))
+                cost_matrix[i, j] = 100.0 if not gate_pass else (1.0 - score)
+
+                row = {
+                    "frame": int(self.current_step),
+                    "lost_id": int(lost_track_data.id.item()),
+                    "lost_age": int(monitor.lost_age),
+                    "det_idx": int(j),
+                    "app_score": app_score,
+                    "app_thr": app_thr,
+                    "app_margin": app_score - app_thr,
+                    "pos_score": pos_score,
+                    "dist": dist,
+                    "dist_thr": dist_thr,
+                    "dist_margin": dist_thr - dist,
+                    "active_overlap": active_overlap,
+                    "active_overlap_thr": active_overlap_thr,
+                    "active_overlap_margin": active_overlap_thr - active_overlap,
+                    "revive_penalty": float(monitor.revive_penalty),
+                    "score": score,
+                    "gate_pass": gate_pass,
+                    "selected_by_assignment": False,
+                    "accepted/rejected": "rejected",
+                    "reason": "not_selected" if gate_pass else ";".join(gate_reasons),
+                }
+                self.revive_decision_log.append(row)
+                pair_log_index[(i, j)] = len(self.revive_decision_log) - 1
+
+        row_indices, col_indices = linear_sum_assignment(cost_matrix.numpy())
+        used_det_indices = []
+        indices_to_remove = []
+        accept_cost_thr = 1.0 - self.revive_accept_thr
+
+        for r, c in zip(row_indices, col_indices):
+            log_idx = pair_log_index.get((r, c))
+            if log_idx is None:
+                continue
+            row = self.revive_decision_log[log_idx]
+            row["selected_by_assignment"] = True
+
+            if cost_matrix[r, c] >= accept_cost_thr or not row["gate_pass"]:
+                if row["gate_pass"]:
+                    row["reason"] = "score_below_accept"
+                continue
+
+            lost_track_data, monitor = self.lost_tracks[r]
+            best_det_idx = c
+            score = 1.0 - cost_matrix[r, c]
+            row["accepted/rejected"] = "accepted"
+            row["reason"] = "accepted"
+            print(
+                " >>> REVIVED ID "
+                f"{lost_track_data.id.item()}! Score: {score:.3f} "
+                f"app={row['app_score']:.3f} dist={row['dist']:.3f} age={row['lost_age']} "
+                f"penalty={row['revive_penalty']:.3f}"
+            )
+
+            revived_data_dict = {}
+            for k, v in detections.items():
+                if k in self.ref_dims:
+                    if not isinstance(v, torch.Tensor):
+                        continue
+                    revived_data_dict[k] = v[:, best_det_idx : best_det_idx + 1]
+
+            if "betas" not in revived_data_dict:
+                continue
+
+            ref_tensor = revived_data_dict["betas"]
+            current_batch_size = ref_tensor.shape[:2]
+            if current_batch_size[1] == 0:
+                continue
+
+            if "id" not in revived_data_dict:
+                temp_id = torch.zeros((*current_batch_size, 1), device=ref_tensor.device)
+                revived_data_dict["id"] = temp_id
+
+            revived_track = TrackTensorState(
+                **revived_data_dict,
+                batch_size=current_batch_size,
+            ).clone()
+            revived_track.id[:] = lost_track_data.id
+
+            if self.current_tracks is None:
+                self.current_tracks = revived_track
+            else:
+                self.current_tracks = torch.cat([self.current_tracks, revived_track], 1)
+
+            monitor.revive_count += 1
+            monitor.lost_age = 0
+            monitor.revive_age = 0
+            self.health_monitors[lost_track_data.id.item()] = monitor
+
+            new_pos = revived_track.trans[0].cpu()
+            new_hidden = revived_track.appearance[0].squeeze(0).cpu()
+            monitor.update(new_pos, 1.0, 0.0, 1.0, current_hidden=new_hidden)
+            indices_to_remove.append(r)
+            used_det_indices.append(best_det_idx)
+
+        indices_to_remove.sort(reverse=True)
+        for idx in indices_to_remove:
+            self.lost_tracks.pop(idx)
+
+        print(f"[Revive] evaluated {num_lost * num_dets} pairs, accepted {len(used_det_indices)}")
+        return used_det_indices
+
     def initialize_missing_tracks(self, detections, update_fn):
         """Check for missing detections that should be initialized.
             改进：使用未匹配到的帧来复活Lost tracks
@@ -654,6 +1005,55 @@ class TrackHandler:
         self.lost_tracks = active_lost_tracks   #保留未超时轨迹
 
         
+
+    def clear_invalid_tracks(self):
+        keep_mask = []
+
+        if self.current_tracks is None:
+            self.lost_tracks = []
+            return
+
+        for i in range(self.current_tracks.shape[1]):
+            track_id = self.current_tracks.id[0, i].item()
+            health = self.health_monitors[track_id].get_current_health()
+            if health > 0:
+                keep_mask.append(True)
+                continue
+
+            keep_mask.append(False)
+            monitor = self.health_monitors[track_id]
+            if monitor.age > 5:
+                already_in_lost = any(
+                    existing_track.id.item() == track_id
+                    for existing_track, _ in self.lost_tracks
+                )
+                if not already_in_lost:
+                    lost_track_data = self.current_tracks[:, i : i + 1].clone()
+                    if monitor.revive_count > 0 and monitor.revive_age <= self.revive_quick_loss_window:
+                        monitor.quick_reloss_count += 1
+                        monitor.revive_penalty = min(
+                            self.revive_penalty_max,
+                            monitor.revive_penalty + self.revive_penalty_step,
+                        )
+                    monitor.lost_age = 0
+                    self.lost_tracks.append((lost_track_data, monitor))
+            else:
+                del self.health_monitors[track_id]
+
+        if len(keep_mask) > 0:
+            keep_mask = torch.tensor(keep_mask, device=self.current_tracks.device)
+            self.current_tracks = self.current_tracks[:, keep_mask]
+        else:
+            self.current_tracks = None
+
+        active_lost_tracks = []
+        for track_data, monitor in self.lost_tracks:
+            monitor.lost_age += 1
+            if monitor.lost_age <= self.max_lost_patience:
+                active_lost_tracks.append((track_data, monitor))
+            else:
+                print(f"ID{track_data.id.item()} is dead")
+        self.lost_tracks = active_lost_tracks
 
     def update(self, curr_detections, update_fn, shot_reset=False):
         """Run tracking update step."""

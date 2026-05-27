@@ -2,10 +2,17 @@
 """Demo CoMotion with a video file or a directory of images."""
 
 import logging
+import csv
 import os
 import shutil
 import tempfile
+import sys
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 import click
 import numpy as np
@@ -216,6 +223,14 @@ def visualize_poses(
 
     # Remove temporary directory
     shutil.rmtree(tmp_vis_dir)
+
+
+def write_revive_log_csv(path: Path, rows, fieldnames) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def run_detection(
@@ -508,6 +523,22 @@ def track_poses(
 
 
 # [新增] 后处理工具函数
+    if hasattr(model, "handler") and hasattr(model.handler, "revive_decision_log"):
+        revive_log_path = cache_path.with_name(f"{cache_path.stem}_revive_log.csv")
+        write_revive_log_csv(
+            revive_log_path,
+            model.handler.revive_decision_log,
+            getattr(
+                model.handler,
+                "revive_log_fields",
+                list(model.handler.revive_decision_log[0].keys())
+                if model.handler.revive_decision_log
+                else [],
+            ),
+        )
+        print(f"Saved revive log to {revive_log_path}")
+
+
 def perform_stitching(preds, time_thr=30, dist_thr=2.0, app_thr=0.6):
     """
     [调试版] 轨迹缝合：包含强制重叠检查
@@ -830,7 +861,7 @@ def write_interpolated_mot(txt_path, preds, bboxes, max_gap=30):
             line = f"{fid + 1},{tid},{x1:.2f},{y1:.2f},{w:.2f},{h:.2f},1,1,1\n"
             f.write(line)
             
-    print(f"✅ 已保存结果到 {txt_path} (含插值处理)")
+    print(f"Saved results to {txt_path} (with interpolation)")
 
 @click.command()
 @click.option(
