@@ -165,7 +165,8 @@ def run_inference(metadata, temp_dir, demo_args):
 def fix_trans_for_global_view(trans, slice_idx, metadata):
     W, H = metadata["W"], metadata["H"]
     slice_w, slice_h = metadata["slice_dims"][slice_idx]
-    f = 2 * max(slice_w, slice_h)
+    f_slice = 2 * max(slice_w, slice_h)
+    f_global = 2 * max(W, H)
     
     cx_global, cy_global = W / 2, H / 2
     off_y, off_x = metadata["offsets"][slice_idx]
@@ -177,10 +178,11 @@ def fix_trans_for_global_view(trans, slice_idx, metadata):
     
     z = trans[..., 2]
     trans_fixed = trans.clone()
-    trans_fixed[..., 0] -= (delta_cx * z / f)
-    trans_fixed[..., 1] -= (delta_cy * z / f)
+    trans_fixed[..., 0] -= (delta_cx * z / f_slice)
+    trans_fixed[..., 1] -= (delta_cy * z / f_slice)
+    trans_fixed[..., 2] *= f_global / f_slice
     
-    return trans_fixed, f
+    return trans_fixed, f_global
 
 
 def make_camera_matrix(focal, width, height):
@@ -628,7 +630,7 @@ def merge_track_data(metadata, temp_dir):
         "pose": [], "trans": [], "betas": [], "appearance": [],
         "frame_idx": [], "bbox_local": [], "bbox_global": [],
     }
-    inferred_focals = []
+    render_focal = 2 * max(metadata["W"], metadata["H"])
     names = metadata["names"]
 
     try:
@@ -651,8 +653,7 @@ def merge_track_data(metadata, temp_dir):
         if data['id'].numel() == 0: continue
         
         local_bboxes, global_bboxes = compute_slice_bboxes(decoder, data, i, metadata)
-        trans_fixed, focal = fix_trans_for_global_view(data["trans"], i, metadata)
-        inferred_focals.append(focal)
+        trans_fixed, _ = fix_trans_for_global_view(data["trans"], i, metadata)
         source_ids = data['id'].long().reshape(-1)
         shifted_ids = source_ids + id_shifts[i]
         n = shifted_ids.shape[0]
@@ -678,8 +679,7 @@ def merge_track_data(metadata, temp_dir):
     for k in merged_data:
         final_preds[k] = torch.cat(merged_data[k], dim=0)
     final_preds = merge_cross_slice_duplicates(final_preds, metadata)
-    avg_focal = sum(inferred_focals) / len(inferred_focals)
-    return final_preds, avg_focal
+    return final_preds, render_focal
 
 # ============================
 # Step 3.5: 保存 TXT (Batch Processing)
