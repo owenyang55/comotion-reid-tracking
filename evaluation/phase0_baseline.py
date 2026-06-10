@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -60,6 +61,12 @@ def parse_args() -> argparse.Namespace:
         help="输入视频、图片目录或单张图片。多个序列可重复传入。",
     )
     parser.add_argument(
+        "--sequence-name",
+        action="append",
+        default=[],
+        help="输入对应的评估序列名。多个输入时需按顺序重复传入，例如 MOT20-02。",
+    )
+    parser.add_argument(
         "--prediction-dir",
         type=Path,
         default=None,
@@ -81,8 +88,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="只汇总已有预测结果，不调用 demo.py。",
     )
+    parser.add_argument(
+        "--demo-root",
+        type=Path,
+        default=REPO_ROOT,
+        help="要调用的 CoMotion 仓库根目录。跑原始基线时传入原版 ml-comotion 路径。",
+    )
     parser.add_argument("--start-frame", type=int, default=0)
-    parser.add_argument("--num-frames", type=int, default=300)
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=1_000_000_000,
+        help="要处理的帧数。默认使用一个极大值，等价于处理完整输入。",
+    )
     parser.add_argument("--frameskip", type=int, default=1)
     parser.add_argument(
         "--require-reid",
@@ -146,16 +164,44 @@ def run_demo(args: argparse.Namespace, prediction_dir: Path) -> list[list[str]]:
         return commands
     if not args.input:
         raise ValueError("请至少提供一个 --input，或使用 --skip-demo 搭配 --prediction-dir。")
+    if args.sequence_name and len(args.sequence_name) != len(args.input):
+        raise ValueError("--sequence-name 的数量必须与 --input 数量一致。")
 
+    demo_root = args.demo_root.resolve()
+    demo_path = demo_root / "demo.py"
+    if not demo_path.exists():
+        raise FileNotFoundError(f"没有找到 demo.py: {demo_path}")
+    demo_text = demo_path.read_text(encoding="utf-8", errors="ignore")
+    if args.require_reid and "--require-reid" not in demo_text:
+        raise ValueError(f"{demo_path} 不支持 --require-reid，请去掉该参数。")
+
+    demo_env = os.environ.copy()
+    demo_env["PYTHONIOENCODING"] = "utf-8"
+    demo_src = demo_root / "src"
+    if demo_src.exists():
+        old_pythonpath = demo_env.get("PYTHONPATH")
+        if old_pythonpath:
+            demo_env["PYTHONPATH"] = f"{demo_src}{os.pathsep}{old_pythonpath}"
+        else:
+            demo_env["PYTHONPATH"] = str(demo_src)
+
+    prediction_dir = prediction_dir.resolve()
     prediction_dir.mkdir(parents=True, exist_ok=True)
-    for input_path in args.input:
+    for idx, input_path in enumerate(args.input):
+        input_path = input_path.resolve()
+        sequence_name = args.sequence_name[idx] if args.sequence_name else input_path.stem
+        run_output_dir = prediction_dir
+        if args.sequence_name:
+            run_output_dir = prediction_dir / f"_raw_{sequence_name}"
+            run_output_dir.mkdir(parents=True, exist_ok=True)
+
         cmd = [
             sys.executable,
-            str(REPO_ROOT / "demo.py"),
+            str(demo_path),
             "-i",
             str(input_path),
             "-o",
-            str(prediction_dir),
+            str(run_output_dir),
             "--skip-visualization",
             "--start-frame",
             str(args.start_frame),
@@ -167,8 +213,15 @@ def run_demo(args: argparse.Namespace, prediction_dir: Path) -> list[list[str]]:
         if args.require_reid:
             cmd.append("--require-reid")
         cmd.extend(args.extra_demo_arg)
-        subprocess.run(cmd, cwd=REPO_ROOT, check=True)
+        subprocess.run(cmd, cwd=demo_root, check=True, env=demo_env)
         commands.append(cmd)
+
+        if args.sequence_name:
+            input_stem = input_path.stem
+            for suffix in (".txt", ".pt"):
+                source = run_output_dir / f"{input_stem}{suffix}"
+                if source.exists():
+                    shutil.copy2(source, prediction_dir / f"{sequence_name}{suffix}")
     return commands
 
 
@@ -301,15 +354,23 @@ def trackeval_gt_file(args: argparse.Namespace, seq_name: str) -> Path:
 
 
 def write_seqmap_from_predictions(prediction_dir: Path, output_dir: Path, args: argparse.Namespace) -> Path:
+    mot_files = sorted(prediction_dir.glob("*.txt"))
+    if not mot_files:
+        raise ValueError(f"预测目录中没有 txt 文件: {prediction_dir}")
+
     seq_names = []
     skipped = []
-    for path in sorted(prediction_dir.glob("*.txt")):
+    for path in mot_files:
         if trackeval_gt_file(args, path.stem).exists():
             seq_names.append(path.stem)
         else:
             skipped.append(path.stem)
     if not seq_names:
-        raise ValueError("预测目录中的 txt 没有匹配到可用的 TrackEval GT。")
+        raise ValueError(
+            "预测目录中的 txt 没有匹配到可用的 TrackEval GT。"
+            f" 预测序列: {', '.join(path.stem for path in mot_files)}。"
+            f" GT 根目录: {args.gt_folder}"
+        )
     if skipped:
         print(f"以下预测文件没有匹配 GT，已从临时 seqmap 跳过: {', '.join(skipped)}")
     seqmap_path = output_dir / "phase0_seqmap_from_predictions.txt"

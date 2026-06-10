@@ -4,6 +4,7 @@
 import logging
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -34,6 +35,24 @@ except ImportError:
 # [修正] 导入必要模块
 from comotion_demo.models import refine
 from scenedetect.detectors import ContentDetector
+
+
+def configure_skvideo_ffmpeg():
+    ffmpeg_dir = os.environ.get("COMOTION_FFMPEG_PATH")
+    if ffmpeg_dir is None:
+        candidate = Path(sys.prefix) / "Library" / "bin"
+        if (candidate / "ffmpeg.exe").exists() and (candidate / "ffprobe.exe").exists():
+            ffmpeg_dir = str(candidate)
+    if ffmpeg_dir:
+        try:
+            import skvideo
+
+            skvideo.setFFmpegPath(ffmpeg_dir)
+        except Exception as exc:
+            logging.warning("Could not configure skvideo FFmpeg path: %s", exc)
+
+
+configure_skvideo_ffmpeg()
 
 try:
     from aitviewer.configuration import CONFIG
@@ -82,6 +101,47 @@ def init_reid_model(mode_name: str, require_reid: bool = False):
             raise RuntimeError(msg) from e
         print(f"WARNING: {msg}. Falling back to zero appearance features.")
         return None
+
+
+def build_tracker_kwargs(
+    memory_mode,
+    enable_occlusion_gate,
+    enable_motion_damping,
+    enable_init_iou_suppress,
+    disable_reid_revival,
+    revive_accept_thr,
+    revive_app_thr,
+    revive_occluded_app_thr,
+    revive_unoccluded_app_thr,
+    occlusion_overlap_thr,
+    occlusion_hold_frames,
+    occlusion_lost_patience,
+    occlusion_short_lost_patience,
+    motion_dampen_factor,
+    init_iou_suppress_thr,
+    revive_log_path,
+):
+    if revive_log_path is not None:
+        revive_log_path.parent.mkdir(parents=True, exist_ok=True)
+        revive_log_path = str(revive_log_path)
+    return {
+        "memory_mode": memory_mode,
+        "enable_occlusion_gate": enable_occlusion_gate,
+        "enable_motion_damping": enable_motion_damping,
+        "enable_init_iou_suppress": enable_init_iou_suppress,
+        "enable_reid_revival": not disable_reid_revival,
+        "revive_accept_thr": revive_accept_thr,
+        "revive_app_thr": revive_app_thr,
+        "revive_occluded_app_thr": revive_occluded_app_thr,
+        "revive_unoccluded_app_thr": revive_unoccluded_app_thr,
+        "occlusion_overlap_thr": occlusion_overlap_thr,
+        "occlusion_hold_frames": occlusion_hold_frames,
+        "occlusion_lost_patience": occlusion_lost_patience,
+        "occlusion_short_lost_patience": occlusion_short_lost_patience,
+        "motion_dampen_factor": motion_dampen_factor,
+        "init_iou_suppress_thr": init_iou_suppress_thr,
+        "revive_log_path": revive_log_path,
+    }
 
 
 def prepare_scene(viewer, width, height, K, image_paths, fps=30):
@@ -214,8 +274,9 @@ def visualize_poses(
         ensure_no_overwrite=False,
     )
 
-    # Remove temporary directory
-    shutil.rmtree(tmp_vis_dir)
+    # Keep the temporary frames directory. Project instructions forbid recursive
+    # directory deletion from automation.
+    logging.info("Keeping temporary render frames at %s", tmp_vis_dir)
 
 
 def run_detection(
@@ -284,6 +345,12 @@ def track_poses(
     frameskip=1,
     model=None,
     require_reid=False,
+    tracker_kwargs=None,
+    postprocess_mode="current",
+    stitch_time_thr=15,
+    stitch_dist_thr=1.0,
+    stitch_app_thr=0.75,
+    interp_max_gap=30,
 ):
     """Track poses over a video or a directory of images."""
     if model is None:
@@ -318,7 +385,7 @@ def track_poses(
 
             if not initialized:
                 image_res = image.shape[-2:]
-                model.init_tracks(image_res)
+                model.init_tracks(image_res, tracker_kwargs=tracker_kwargs)
                 initialized = True
 
             # 1. 输入图像预处理 (在 CPU 上准备)
@@ -441,8 +508,17 @@ def track_poses(
             preds["frame_idx"] = frame_idxs
 
             #插入缝合函数(参数含义暂时未知)
-            preds = perform_stitching(preds, time_thr=15, dist_thr=1.0, app_thr=0.75)
-            preds = apply_interpolation_to_tensor(preds, max_gap=30)
+            apply_stitch = postprocess_mode in {"current", "stitch", "stitch-interpolate"}
+            apply_interp = postprocess_mode in {"current", "interpolate", "stitch-interpolate"}
+            if apply_stitch:
+                preds = perform_stitching(
+                    preds,
+                    time_thr=stitch_time_thr,
+                    dist_thr=stitch_dist_thr,
+                    app_thr=stitch_app_thr,
+                )
+            if apply_interp:
+                preds = apply_interpolation_to_tensor(preds, max_gap=interp_max_gap)
             torch.save(preds, cache_path)
 
             # Save bounding box tracks in MOT format
@@ -462,7 +538,7 @@ def track_poses(
                 txt_path,
                 preds,
                 bboxes,
-                max_gap=30,
+                max_gap=interp_max_gap if apply_interp else 0,
             )
         
             # # 准备数据
@@ -877,6 +953,46 @@ def write_interpolated_mot(txt_path, preds, bboxes, max_gap=30):
     is_flag=True,
     help="Fail fast if DINOv2 ReID cannot be loaded (prevents silent fallback).",
 )
+@click.option(
+    "--output-name",
+    default=None,
+    type=str,
+    help="Override output stem for .pt/.txt/.mp4 files.",
+)
+@click.option(
+    "--memory-mode",
+    default="long",
+    type=click.Choice(["off", "basic", "long", "occlusion"]),
+    help="Lost-track memory policy for ablation.",
+)
+@click.option("--enable-occlusion-gate", is_flag=True)
+@click.option("--enable-motion-damping", is_flag=True)
+@click.option("--enable-init-iou-suppress", is_flag=True)
+@click.option("--disable-reid-revival", is_flag=True)
+@click.option("--revive-accept-thr", default=0.3, type=float)
+@click.option("--revive-app-thr", default=0.2, type=float)
+@click.option("--revive-occluded-app-thr", default=0.6, type=float)
+@click.option("--revive-unoccluded-app-thr", default=0.75, type=float)
+@click.option("--occlusion-overlap-thr", default=0.45, type=float)
+@click.option("--occlusion-hold-frames", default=10, type=int)
+@click.option("--occlusion-lost-patience", default=30, type=int)
+@click.option("--occlusion-short-lost-patience", default=8, type=int)
+@click.option("--motion-dampen-factor", default=0.89, type=float)
+@click.option("--init-iou-suppress-thr", default=0.7, type=float)
+@click.option(
+    "--revive-log-path",
+    default=None,
+    type=click.Path(exists=False, path_type=Path),
+)
+@click.option(
+    "--postprocess-mode",
+    default="current",
+    type=click.Choice(["current", "off", "stitch", "interpolate", "stitch-interpolate"]),
+)
+@click.option("--stitch-time-thr", default=15, type=int)
+@click.option("--stitch-dist-thr", default=1.0, type=float)
+@click.option("--stitch-app-thr", default=0.75, type=float)
+@click.option("--interp-max-gap", default=30, type=int)
 def main(
     input_path,
     output_dir,
@@ -885,11 +1001,51 @@ def main(
     skip_visualization,
     frameskip,
     require_reid,
+    output_name,
+    memory_mode,
+    enable_occlusion_gate,
+    enable_motion_damping,
+    enable_init_iou_suppress,
+    disable_reid_revival,
+    revive_accept_thr,
+    revive_app_thr,
+    revive_occluded_app_thr,
+    revive_unoccluded_app_thr,
+    occlusion_overlap_thr,
+    occlusion_hold_frames,
+    occlusion_lost_patience,
+    occlusion_short_lost_patience,
+    motion_dampen_factor,
+    init_iou_suppress_thr,
+    revive_log_path,
+    postprocess_mode,
+    stitch_time_thr,
+    stitch_dist_thr,
+    stitch_app_thr,
+    interp_max_gap,
 ):
     """Demo entry point."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    input_name = input_path.stem
+    input_name = output_name or input_path.stem
     skip_visualization = skip_visualization | (not aitviewer_available)
+    tracker_kwargs = build_tracker_kwargs(
+        memory_mode,
+        enable_occlusion_gate,
+        enable_motion_damping,
+        enable_init_iou_suppress,
+        disable_reid_revival,
+        revive_accept_thr,
+        revive_app_thr,
+        revive_occluded_app_thr,
+        revive_unoccluded_app_thr,
+        occlusion_overlap_thr,
+        occlusion_hold_frames,
+        occlusion_lost_patience,
+        occlusion_short_lost_patience,
+        motion_dampen_factor,
+        init_iou_suppress_thr,
+        revive_log_path,
+    )
 
     cache_path = output_dir / f"{input_name}.pt"
     if input_path.suffix.lower() in dataloading.IMAGE_EXTENSIONS:
@@ -909,6 +1065,12 @@ def main(
             num_frames,
             frameskip,
             require_reid=require_reid,
+            tracker_kwargs=tracker_kwargs,
+            postprocess_mode=postprocess_mode,
+            stitch_time_thr=stitch_time_thr,
+            stitch_dist_thr=stitch_dist_thr,
+            stitch_app_thr=stitch_app_thr,
+            interp_max_gap=interp_max_gap,
         )
         if not skip_visualization:
             video_path = output_dir / f"{input_name}.mp4"

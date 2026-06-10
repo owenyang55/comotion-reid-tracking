@@ -36,9 +36,11 @@ class CoMotion(nn.Module):
         self.shot_detector = ContentDetector(threshold=50.0, min_scene_len=3)
         self.frame_count = 0
 
-    def init_tracks(self, image_res):
+    def init_tracks(self, image_res, tracker_kwargs=None):
         """Initialize track handler."""
-        self.handler = track.TrackHandler(track.default_dims, image_res)
+        if tracker_kwargs is None:
+            tracker_kwargs = {}
+        self.handler = track.TrackHandler(track.default_dims, image_res, **tracker_kwargs)
 
     @torch.inference_mode()
     def forward(self, image, K, detection_only=False, use_mps=False):

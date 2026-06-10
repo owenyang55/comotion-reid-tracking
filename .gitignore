@@ -28,3 +28,7 @@ models/
 
 evaluation/data/
 evaluation/*.png
+
+# Generated Phase 0 experiment artifacts that duplicate prediction outputs.
+evaluation/result/**/predictions/
+evaluation/result/**/trackeval/

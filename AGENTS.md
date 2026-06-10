@@ -263,6 +263,26 @@ checkpoints/reid_dinov2_best.pt
 - `apply_interpolation_to_tensor`：对 `trans`、`pose`、`betas` 做线性插值补帧。
 - `write_interpolated_mot`：写出包含 bbox 插值结果的 MOT txt。
 
+## 当前阶段实验结论与后续顺序
+
+最近在 `MOT20-02` 全量实验上已经确认：
+
+- 长期复活是主要风险源。`memory_mode=long` 会明显抬高 `IDSW` 和 `Frag`，而 `memory_mode=off` 与 `basic` 基本一致，说明基础跟踪本身不是主因。
+- 线性插值是负贡献。开启插值后，`IDSW`、`MOTA` 和 `Frag` 变差；离线 stitching 的影响较小，不是主要矛盾。
+
+后续默认顺序：
+
+1. MOT 风格评估先默认关闭插值，stitching 保持可选。
+2. 先做保守复活门控，再做高质量外观记忆过滤。
+3. 所有改动先在 `MOT20-02` 全量上做消融，再决定是否扩到 `MOT20-01/03/05`。
+4. 复现和对比时统一使用 `evaluation/phase0_baseline.py --demo-root ...` 切换原始仓库与当前仓库，不再依赖反复 `pip uninstall comotion-demo` / `pip install -e .`。
+
+当前可作为参考的结果目录：
+
+- `results/mot20_02_baseline_full`
+- `results/mot20_02_improved_full`
+- `evaluation/result/`
+
 ## 输出文件格式
 
 `demo.py` 默认以输入文件/目录 stem 命名输出：

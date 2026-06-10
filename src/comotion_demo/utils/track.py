@@ -1,5 +1,6 @@
 # Copyright (C) 2025 Apple Inc. All Rights Reserved.
 from __future__ import annotations
+import csv
 from scipy.optimize import linear_sum_assignment
 
 from typing import Dict
@@ -77,6 +78,13 @@ class TrackHealthMonitor:
         self.feature_gallery = []   #增加特征队列及队列大小
         self.revive_age = 0 #增加复活后年龄
         self.appearance_emb = None
+        self.lost_age = 0
+        self.not_matched = 0
+        self.is_occluded = False
+        self.occluded_len = 0
+        self.last_occluded_frame = -1
+        self.was_recently_occluded = False
+        self.last_occlusion_score = 0.0
 
         if init_hidden is not None: #存入第一帧
             norm_feat = torch.nn.functional.normalize(init_hidden.float().cpu(), dim=-1)
@@ -95,6 +103,12 @@ class TrackHealthMonitor:
         new_vals = [root_pos, root_vel, match_scores, track_overlap, inbounds_pct]
         for k, v in zip(self.data_keys, new_vals):
             self.attributes[k].update(v)
+
+        match_val = match_scores.item() if hasattr(match_scores, "item") else float(match_scores)
+        if match_val > 0.4:
+            self.not_matched = 0
+            self.is_occluded = False
+            self.occluded_len = 0
 
         #加入关键帧存入操作
         #1、EMA更新
@@ -196,6 +210,25 @@ class TrackHandler:
         overlap_thr=0.6,
         overlap_time_thr=20,
         vel_outlier_thr=0.25,
+        memory_mode="long",
+        enable_occlusion_gate=False,
+        enable_motion_damping=False,
+        enable_init_iou_suppress=False,
+        enable_reid_revival=True,
+        revive_accept_thr=0.3,
+        revive_app_thr=0.2,
+        revive_occluded_app_thr=0.6,
+        revive_unoccluded_app_thr=0.75,
+        revive_pos_base=2.0,
+        revive_pos_growth=0.15,
+        occlusion_overlap_thr=0.45,
+        occlusion_hold_frames=10,
+        occlusion_recent_frames=40,
+        occlusion_lost_patience=30,
+        occlusion_short_lost_patience=8,
+        motion_dampen_factor=0.89,
+        init_iou_suppress_thr=0.7,
+        revive_log_path=None,
     ):
         if ref_dims is None:
             ref_dims = default_dims
@@ -218,6 +251,26 @@ class TrackHandler:
         self.overlap_thr = overlap_thr
         self.overlap_time_thr = overlap_time_thr
         self.vel_outlier_thr = vel_outlier_thr
+        self.memory_mode = memory_mode
+        self.enable_occlusion_gate = enable_occlusion_gate
+        self.enable_motion_damping = enable_motion_damping
+        self.enable_init_iou_suppress = enable_init_iou_suppress
+        self.enable_reid_revival = enable_reid_revival
+        self.revive_accept_thr = revive_accept_thr
+        self.revive_app_thr = revive_app_thr
+        self.revive_occluded_app_thr = revive_occluded_app_thr
+        self.revive_unoccluded_app_thr = revive_unoccluded_app_thr
+        self.revive_pos_base = revive_pos_base
+        self.revive_pos_growth = revive_pos_growth
+        self.occlusion_overlap_thr = occlusion_overlap_thr
+        self.occlusion_hold_frames = occlusion_hold_frames
+        self.occlusion_recent_frames = occlusion_recent_frames
+        self.occlusion_lost_patience = occlusion_lost_patience
+        self.occlusion_short_lost_patience = occlusion_short_lost_patience
+        self.motion_dampen_factor = motion_dampen_factor
+        self.init_iou_suppress_thr = init_iou_suppress_thr
+        self.revive_log_path = revive_log_path
+        self._revive_log_header_written = False
 
         self.lost_tracks = []   #增加丢失轨迹列表
         self.max_lost_patience = 60 #允许消失最大时间
@@ -274,6 +327,172 @@ class TrackHandler:
 
         return helper.normalized_weighted_score(p0, c0, p1, c1)
 
+    def _keypoints_to_bbox(self, kps):
+        valid = ~((kps == 0).all(-1))
+        if valid.sum() < 2:
+            return None
+        pts = kps[valid]
+        return torch.stack(
+            [pts[:, 0].min(), pts[:, 1].min(), pts[:, 0].max(), pts[:, 1].max()]
+        )
+
+    def _bbox_inclusion(self, box_a, box_b):
+        x1 = torch.maximum(box_a[0], box_b[0])
+        y1 = torch.maximum(box_a[1], box_b[1])
+        x2 = torch.minimum(box_a[2], box_b[2])
+        y2 = torch.minimum(box_a[3], box_b[3])
+        inter = (x2 - x1).clamp_min(0) * (y2 - y1).clamp_min(0)
+        area_a = (box_a[2] - box_a[0]).clamp_min(0) * (box_a[3] - box_a[1]).clamp_min(0)
+        return (inter / (area_a + 1e-6)).item()
+
+    def _bbox_iou(self, box_a, box_b):
+        x1 = torch.maximum(box_a[0], box_b[0])
+        y1 = torch.maximum(box_a[1], box_b[1])
+        x2 = torch.minimum(box_a[2], box_b[2])
+        y2 = torch.minimum(box_a[3], box_b[3])
+        inter = (x2 - x1).clamp_min(0) * (y2 - y1).clamp_min(0)
+        area_a = (box_a[2] - box_a[0]).clamp_min(0) * (box_a[3] - box_a[1]).clamp_min(0)
+        area_b = (box_b[2] - box_b[0]).clamp_min(0) * (box_b[3] - box_b[1]).clamp_min(0)
+        return (inter / (area_a + area_b - inter + 1e-6)).item()
+
+    def _occlusion_score_for_track(self, track_idx):
+        if self.current_tracks is None or self.current_tracks.shape[1] <= 1:
+            return 0.0
+        pred_2d = self.current_tracks.pred_2d[0].detach().cpu()
+        target_box = self._keypoints_to_bbox(pred_2d[track_idx])
+        if target_box is None:
+            return 0.0
+
+        best_score = 0.0
+        for other_idx in range(pred_2d.shape[0]):
+            if other_idx == track_idx:
+                continue
+            other_box = self._keypoints_to_bbox(pred_2d[other_idx])
+            if other_box is None:
+                continue
+            inclusion = self._bbox_inclusion(target_box, other_box)
+            iou = self._bbox_iou(target_box, other_box)
+            best_score = max(best_score, inclusion, iou)
+        return best_score
+
+    def _monitor_recently_occluded(self, monitor):
+        return (
+            monitor.was_recently_occluded
+            and monitor.last_occluded_frame >= 0
+            and self.current_step - monitor.last_occluded_frame <= self.occlusion_recent_frames
+        )
+
+    def _lost_patience_for_monitor(self, monitor):
+        if self.memory_mode == "occlusion":
+            if self._monitor_recently_occluded(monitor):
+                return self.occlusion_lost_patience
+            return self.occlusion_short_lost_patience
+        return self.max_lost_patience
+
+    def _dampen_occluded_track(self, track_idx, monitor):
+        if not self.enable_motion_damping:
+            return
+        pos_history = monitor.attributes["root pos"].log
+        if len(pos_history) < 2:
+            return
+        p_last = pos_history[-1].to(self.current_tracks.trans.device)
+        p_prev = pos_history[-2].to(self.current_tracks.trans.device)
+        damped_pos = p_last + (p_last - p_prev) * self.motion_dampen_factor
+        self.current_tracks.trans[0, track_idx] = damped_pos
+
+    def _should_store_lost_track(self, monitor):
+        if self.memory_mode in {"off", "basic"}:
+            return False
+        if self.memory_mode == "occlusion":
+            return self._monitor_recently_occluded(monitor)
+        return True
+
+    def _filter_init_indices(self, candidate_indices, new_state):
+        if not self.enable_init_iou_suppress or len(candidate_indices) == 0:
+            return candidate_indices
+        if self.current_tracks is None or self.current_tracks.shape[1] == 0:
+            return candidate_indices
+
+        active_kps = self.current_tracks.pred_2d[0].detach().cpu()
+        det_kps = new_state.pred_2d[0].detach().cpu()
+        active_boxes = [self._keypoints_to_bbox(kps) for kps in active_kps]
+
+        keep = []
+        for det_idx in candidate_indices:
+            det_idx_int = int(det_idx.item())
+            det_box = self._keypoints_to_bbox(det_kps[det_idx_int])
+            if det_box is None:
+                keep.append(det_idx)
+                continue
+            max_overlap = 0.0
+            for active_box in active_boxes:
+                if active_box is None:
+                    continue
+                max_overlap = max(
+                    max_overlap,
+                    self._bbox_iou(det_box, active_box),
+                    self._bbox_inclusion(det_box, active_box),
+                )
+            if max_overlap < self.init_iou_suppress_thr:
+                keep.append(det_idx)
+
+        if not keep:
+            return candidate_indices.new_empty((0,))
+        return torch.stack(keep).to(candidate_indices.device)
+
+    def _log_revive_event(
+        self,
+        event,
+        track_id,
+        det_idx,
+        score,
+        app_score,
+        dist,
+        dist_thr,
+        lost_age,
+        occluded,
+    ):
+        if not self.revive_log_path:
+            return
+        write_header = not self._revive_log_header_written
+        try:
+            with open(self.revive_log_path, "a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "frame",
+                        "event",
+                        "track_id",
+                        "det_idx",
+                        "score",
+                        "app_score",
+                        "dist",
+                        "dist_thr",
+                        "lost_age",
+                        "occluded",
+                    ],
+                )
+                if write_header:
+                    writer.writeheader()
+                    self._revive_log_header_written = True
+                writer.writerow(
+                    {
+                        "frame": self.current_step,
+                        "event": event,
+                        "track_id": track_id,
+                        "det_idx": det_idx,
+                        "score": round(float(score), 6),
+                        "app_score": round(float(app_score), 6),
+                        "dist": round(float(dist), 6),
+                        "dist_thr": round(float(dist_thr), 6),
+                        "lost_age": int(lost_age),
+                        "occluded": int(bool(occluded)),
+                    }
+                )
+        except OSError as exc:
+            print(f"WARNING: failed to write revive log {self.revive_log_path}: {exc}")
+            self.revive_log_path = None
+
     def initialize_tracks(self, detections, update_fn, init_state=None, conf=None):
         """Get bounding boxes from input detections, and initialize new tracks."""
         if init_state is None:
@@ -325,6 +544,9 @@ class TrackHandler:
             used_det_indices: 列表，包含所有被复活消耗掉的 detection 索引
         """
         # 1. 基础检查
+        if not self.enable_reid_revival or self.memory_mode in {"off", "basic"}:
+            return []
+
         if not self.lost_tracks:
             return []
         
@@ -347,6 +569,9 @@ class TrackHandler:
         # i 从 len-1 递减到 0
 
         cost_matrix = torch.ones((num_lost, num_dets)) * 100.0
+        app_matrix = torch.zeros((num_lost, num_dets))
+        dist_matrix = torch.zeros((num_lost, num_dets))
+        dist_thr_matrix = torch.zeros((num_lost, num_dets))
 
         for i in range(num_lost):
             lost_track_data, monitor = self.lost_tracks[i]
@@ -360,6 +585,13 @@ class TrackHandler:
                 p_last = pos_history[-1].cpu()
                 p_prev = pos_history[-2].cpu()
                 velocity_vector = p_last - p_prev
+                if self.enable_motion_damping and self._monitor_recently_occluded(monitor):
+                    velocity_vector = velocity_vector * (
+                        self.motion_dampen_factor ** max(1, monitor.lost_age)
+                    )
+
+            if self.memory_mode == "occlusion" and not self._monitor_recently_occluded(monitor):
+                continue
             
             #线性运动预测位置
             predicted_pos = last_pos + velocity_vector * monitor.lost_age
@@ -376,8 +608,16 @@ class TrackHandler:
                 dist = torch.norm(predicted_pos - det_pos[j]).item()
 
                 #加入门控机制，同时依据消失时间放大控制范围（好坏未决）
-                predicted_dist = 2.0 + (0.15 * monitor.lost_age)
-                if dist > predicted_dist or app_score < 0.2:
+                predicted_dist = self.revive_pos_base + (self.revive_pos_growth * monitor.lost_age)
+                if self.memory_mode == "occlusion":
+                    app_thr = (
+                        self.revive_occluded_app_thr
+                        if self._monitor_recently_occluded(monitor)
+                        else self.revive_unoccluded_app_thr
+                    )
+                else:
+                    app_thr = self.revive_app_thr
+                if dist > predicted_dist or app_score < app_thr:
                     continue
 
                 pos_score = max(0, 1 - dist / predicted_dist)  #距离特征分数
@@ -391,6 +631,9 @@ class TrackHandler:
 
                 #填入代价矩阵中
                 cost_matrix[i, j] = 1.0 - final_score
+                app_matrix[i, j] = app_score
+                dist_matrix[i, j] = dist
+                dist_thr_matrix[i, j] = predicted_dist
 
 
        
@@ -402,13 +645,37 @@ class TrackHandler:
         indices_to_remove = []
         # 5. 执行复活操作   
         for r, c in zip(row_indices, col_indices):
-            if cost_matrix[r, c] >= 0.7:
+            score = 1.0 - cost_matrix[r, c]
+            if score < self.revive_accept_thr:
+                lost_track_data, monitor = self.lost_tracks[r]
+                self._log_revive_event(
+                    "rejected",
+                    lost_track_data.id.item(),
+                    c,
+                    score,
+                    app_matrix[r, c],
+                    dist_matrix[r, c],
+                    dist_thr_matrix[r, c],
+                    monitor.lost_age,
+                    self._monitor_recently_occluded(monitor),
+                )
                 continue
 
             lost_track_data, monitor = self.lost_tracks[r]
             best_det_idx = c
             score = 1.0 - cost_matrix[r, c]
             print(f" >>> REVIVED ID {lost_track_data.id.item()}! Score: {score:.3f}")
+            self._log_revive_event(
+                "accepted",
+                lost_track_data.id.item(),
+                best_det_idx,
+                score,
+                app_matrix[r, c],
+                dist_matrix[r, c],
+                dist_thr_matrix[r, c],
+                monitor.lost_age,
+                self._monitor_recently_occluded(monitor),
+            )
 
         
             #复活逻辑构建
@@ -500,6 +767,7 @@ class TrackHandler:
             unmatched = (
                 (detection_max_match_score < self.missing_match_thr).nonzero().flatten()
             )
+            unmatched = self._filter_init_indices(unmatched, new_state)
 
             if len(unmatched) > 0:
                 missing = new_state[:, unmatched]
@@ -614,10 +882,37 @@ class TrackHandler:
 
             #依据健康值决定是否keep
             if health > 0:
+                monitor = self.health_monitors[track_id]
+                monitor.not_matched = 0
+                monitor.is_occluded = False
+                monitor.occluded_len = 0
                 keep_mask.append(True)
             else:
-                keep_mask.append(False)
                 monitor = self.health_monitors[track_id]
+                monitor.not_matched += 1
+                occlusion_score = (
+                    self._occlusion_score_for_track(i)
+                    if self.enable_occlusion_gate
+                    else 0.0
+                )
+                monitor.last_occlusion_score = occlusion_score
+                if (
+                    self.enable_occlusion_gate
+                    and occlusion_score >= self.occlusion_overlap_thr
+                    and monitor.occluded_len < self.occlusion_hold_frames
+                ):
+                    monitor.is_occluded = True
+                    monitor.was_recently_occluded = True
+                    monitor.last_occluded_frame = self.current_step
+                    monitor.occluded_len += 1
+                    self._dampen_occluded_track(i, monitor)
+                    keep_mask.append(True)
+                    continue
+
+                keep_mask.append(False)
+                if not self._should_store_lost_track(monitor):
+                    del self.health_monitors[track_id]
+                    continue
                 if monitor.age > 5: #存在时间超过5帧
                     already_in_lost = False
                     for existing_track, _ in self.lost_tracks:
@@ -645,7 +940,7 @@ class TrackHandler:
         active_lost_tracks = []
         for track_data, monitor in self.lost_tracks:
             monitor.lost_age += 1 #将Lost的时间加1
-            if monitor.lost_age <= self.max_lost_patience:
+            if monitor.lost_age <= self._lost_patience_for_monitor(monitor):
                 active_lost_tracks.append((track_data,monitor))
             else:
                 print(f"ID{track_data.id.item()} is dead")
